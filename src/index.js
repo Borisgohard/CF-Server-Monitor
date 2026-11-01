@@ -89,7 +89,15 @@ async function decryptTurnstileData(encoded, env, sys) {
 }
 
 async function isTurnstileVerified(request, env, sys) {
-  const verifiedHeader = request.headers.get('X-Turnstile-Verified');
+  let verifiedHeader = request.headers.get('X-Turnstile-Verified');
+  // Browser WebSockets cannot set custom headers; carry the existing proof as a subprotocol.
+  if (!verifiedHeader && new URL(request.url).pathname === '/api/ws') {
+    const proofs = (request.headers.get('Sec-WebSocket-Protocol') || '')
+      .split(',').map(value => value.trim()).filter(value => value.startsWith('cfsm-turnstile.'));
+    if (proofs.length === 1) {
+      verifiedHeader = proofs[0].slice('cfsm-turnstile.'.length).replace(/-/g, '+').replace(/_/g, '/');
+    }
+  }
   
   if (!verifiedHeader) return false;
   
@@ -222,7 +230,6 @@ export default {
 
     const bypassTurnstilePaths = [
       '/admin/api',
-      '/api/ws',
     ];
 
     const isApiRequest = path.startsWith('/api/') || path.startsWith('/admin/api');
@@ -434,8 +441,14 @@ export default {
       if (route.method === method && route.path === path) {
         const response = await route.handler();
 
-        // WebSocket 升级响应直接原样返回，不能修改 response 对象
+        // Select only the public protocol, never echo the verification credential.
         if (response.status === 101) {
+          const protocols = (request.headers.get('Sec-WebSocket-Protocol') || '').split(',').map(value => value.trim());
+          if (path === '/api/ws' && protocols.includes('cfsm-v1')) {
+            const headers = new Headers(response.headers);
+            headers.set('Sec-WebSocket-Protocol', 'cfsm-v1');
+            return new Response(null, { status: 101, webSocket: response.webSocket, headers });
+          }
           return response;
         }
 

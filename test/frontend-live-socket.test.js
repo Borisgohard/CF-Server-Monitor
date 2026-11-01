@@ -6,8 +6,9 @@ import { createServer } from 'vite'
 class FakeWebSocket {
   static instances = []
 
-  constructor(url) {
+  constructor(url, protocols) {
     this.url = url
+    this.protocols = protocols
     this.listeners = new Map()
     this.sent = []
     this.closeCalls = []
@@ -37,7 +38,7 @@ test('frontend WebSocket closes at its lifetime limit without reconnecting', asy
   const vite = await createServer({
     appType: 'custom',
     logLevel: 'silent',
-    server: { middlewareMode: true }
+    server: { middlewareMode: true, https: false }
   })
   const { createLiveSocket, normalizeLiveSocketTimeoutMinutes } = await vite.ssrLoadModule('/src/frontend/utils/api.js')
   const originalWindow = globalThis.window
@@ -112,6 +113,33 @@ test('frontend WebSocket closes at its lifetime limit without reconnecting', asy
     globalThis.WebSocket = originalWebSocket
     globalThis.setTimeout = originalSetTimeout
     globalThis.clearTimeout = originalClearTimeout
+    await vite.close()
+  }
+})
+
+test('frontend WebSocket sends existing verification in protocols instead of the URL', async () => {
+  const vite = await createServer({ appType: 'custom', logLevel: 'silent', server: { middlewareMode: true, https: false } })
+  const { createLiveSocket } = await vite.ssrLoadModule('/src/frontend/utils/api.js')
+  const { STORAGE } = await vite.ssrLoadModule('/src/frontend/utils/constants.js')
+  const originals = { window: globalThis.window, localStorage: globalThis.localStorage, WebSocket: globalThis.WebSocket }
+  let socket
+  let noProofSocket
+  try {
+    globalThis.window = { location: { origin: 'https://example.com', protocol: 'https:', host: 'example.com' } }
+    globalThis.localStorage = { getItem: key => key === STORAGE.TURNSTILE_VERIFIED ? 'abc+/def==' : '' }
+    globalThis.WebSocket = FakeWebSocket
+    FakeWebSocket.instances = []
+    socket = createLiveSocket('server-1')
+    const created = FakeWebSocket.instances[0]
+    assert.deepEqual(created.protocols, ['cfsm-v1', 'cfsm-turnstile.abc-_def'])
+    assert.equal(new URL(created.url).search, '?subscribe=server-1')
+    globalThis.localStorage = { getItem: () => '' }
+    noProofSocket = createLiveSocket('all')
+    assert.deepEqual(FakeWebSocket.instances[1].protocols, ['cfsm-v1'])
+  } finally {
+    socket?.close()
+    noProofSocket?.close()
+    Object.assign(globalThis, originals)
     await vite.close()
   }
 })

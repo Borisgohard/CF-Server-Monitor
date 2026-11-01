@@ -152,7 +152,12 @@ export const createLiveSocket = (subscribe, handlers = {}, apiIndex = 0, serverI
       if (token && !isSameHostWebSocket(url)) {
         url.searchParams.set('token', token)
       }
-      socket = new WebSocket(url.toString())
+      const protocols = ['cfsm-v1']
+      const verified = localStorage.getItem(STORAGE.TURNSTILE_VERIFIED)
+      if (verified) {
+        protocols.push('cfsm-turnstile.' + verified.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''))
+      }
+      socket = new WebSocket(url.toString(), protocols)
       ws = socket
     } catch (e) {
       setStatus(false, 'WebSocket not supported')
