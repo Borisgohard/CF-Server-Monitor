@@ -17,6 +17,7 @@ import { evaluateTrafficAlert } from '../services/notification.js';
 import { ensureServerOptimization } from '../database/indexOptimization.js';
 import { getServerDetail, clearServerDetailCache } from '../utils/cache.js';
 import { getWssReportScheduleState, loadSiteSettings } from '../utils/settings.js';
+import { checkWebSocketAuth } from '../middleware/auth.js';
 import {
   AGENT_CONFIG_MD5_HEADER,
   AGENT_CONFIG_LEGACY_SCHEMA_VERSION,
@@ -51,6 +52,7 @@ import {
 } from '../utils/config.js';
 
 const MAX_SUBSCRIBE_IDS = 500;
+const PUBLIC_SERVER_IDS_TTL_MS = 30 * 1000;
 const MAX_SERVER_ID_LENGTH = 64;
 const SERVER_ID_PATTERN = /^[A-Za-z0-9._:-]+$/;
 const WS_POLICY_VIOLATION = 1008;
@@ -1022,6 +1024,8 @@ export class MetricsBroadcaster {
     clearServerDetailCache();
     this.agentServerDetails.delete(serverId);
 
+    this.publicServerIdsCache = null;
+
     const descriptor = await this._loadAgentConfigDescriptor(serverId, true, AGENT_CONFIG_SCHEMA_VERSION);
     if (!descriptor) {
       return new Response(JSON.stringify({ error: 'server not found' }), {
@@ -1073,10 +1077,10 @@ export class MetricsBroadcaster {
     }
     this._cacheLatestReportUpdates(normalizedUpdates, reportTs);
     if (options.batchFrontend === true) {
-      this._broadcastBatch(normalizedUpdates, reportTs, 'single');
+      await this._broadcastBatch(normalizedUpdates, reportTs, 'single');
       this._queueFrontendBroadcastBatch(normalizedUpdates, reportTs);
     } else {
-      this._broadcastBatch(normalizedUpdates, reportTs);
+      await this._broadcastBatch(normalizedUpdates, reportTs);
     }
   }
 
@@ -1115,11 +1119,13 @@ export class MetricsBroadcaster {
 
     this.frontendBroadcastTimer = setTimeout(() => {
       this.frontendBroadcastTimer = null;
-      this._flushFrontendBroadcastBatch();
+      this._flushFrontendBroadcastBatch().catch(error => {
+        console.warn('[ws] Frontend batch failed:', error?.message || error);
+      });
     }, AGENT_WSS_FRONTEND_BATCH_WINDOW_MS);
   }
 
-  _flushFrontendBroadcastBatch() {
+  async _flushFrontendBroadcastBatch() {
     if (this.frontendBroadcastTimer !== null) {
       clearTimeout(this.frontendBroadcastTimer);
       this.frontendBroadcastTimer = null;
@@ -1133,7 +1139,7 @@ export class MetricsBroadcaster {
     const ts = this.pendingFrontendBroadcastTs || Date.now();
     this.pendingFrontendBroadcasts = new Map();
     this.pendingFrontendBroadcastTs = 0;
-    this._broadcastBatch(updates, ts, 'all');
+    await this._broadcastBatch(updates, ts, 'all');
   }
 
   _getAgentRealtimeState(now = Date.now()) {
@@ -1546,6 +1552,9 @@ export class MetricsBroadcaster {
         return new Response('Invalid subscription scope', { status: 400 });
       }
 
+      const settings = await loadSiteSettings(this.env.DB);
+      const includeHidden = await checkWebSocketAuth(request, this.env, settings);
+
       // @ts-ignore - Cloudflare Workers 运行时提供 WebSocketPair
       const pair = new WebSocketPair();
       const [client, server] = Object.values(pair);
@@ -1554,7 +1563,7 @@ export class MetricsBroadcaster {
       this.state.acceptWebSocket(server);
 
       // 将订阅 scope 和空 serverIds 附加到 WebSocket（休眠后仍保留）
-      server.serializeAttachment({ scope, serverIds: [] });
+      server.serializeAttachment({ scope, serverIds: [], includeHidden });
 
       // 立即发送 hello 让客户端确认连接成功
       try {
@@ -1617,7 +1626,7 @@ export class MetricsBroadcaster {
           samples: [{ ts: reportTs, data: payload }]
         }], reportTs);
       }
-      this._broadcast(serverId, payload);
+      await this._broadcast(serverId, payload);
       return new Response(JSON.stringify({ ok: true, subscribers }), {
         headers: { 'Content-Type': 'application/json' }
       });
@@ -1759,14 +1768,14 @@ export class MetricsBroadcaster {
   }
 
   // 向所有匹配 scope 的 WebSocket 广播推送
-  _broadcast(serverId, payload) {
+  async _broadcast(serverId, payload) {
     const ts = Date.now();
     const updates = [{
       serverId,
       samples: [{ ts, data: payload }]
     }];
     this._cacheLatestReportUpdates(updates, ts);
-    this._broadcastBatch(updates, ts);
+    await this._broadcastBatch(updates, ts);
   }
 
   _pruneLatestReportUpdates(now = Date.now()) {
@@ -2096,8 +2105,28 @@ export class MetricsBroadcaster {
     }).filter(Boolean);
   }
 
-  _broadcastBatch(updates, ts = Date.now(), targetScope = null) {
+  async _getPublicServerIds() {
+    const now = Date.now();
+    if (this.publicServerIdsCache && now - this.publicServerIdsCache.time < PUBLIC_SERVER_IDS_TTL_MS) {
+      return this.publicServerIdsCache.ids;
+    }
+    const { results } = await this.env.DB.prepare('SELECT id FROM servers WHERE COALESCE(is_hidden, 0) != 1').all();
+    const ids = new Set(results.map(server => server.id));
+    this.publicServerIdsCache = { time: now, ids };
+    return ids;
+  }
+
+  async _broadcastBatch(updates, ts = Date.now(), targetScope = null) {
     const websockets = this._getFrontendWebSockets();
+    let publicIds = new Set();
+    if (websockets.some(ws => ws.deserializeAttachment()?.includeHidden !== true)) {
+      try {
+        publicIds = await this._getPublicServerIds();
+      } catch (error) {
+        // A failed permission lookup must never make hidden metrics public.
+        console.warn('[ws] Visibility lookup failed:', error?.message || error);
+      }
+    }
 
     for (const ws of websockets) {
       const attachment = ws.deserializeAttachment();
@@ -2106,6 +2135,7 @@ export class MetricsBroadcaster {
       if (targetScope === 'single' && attachment.scope === 'all') continue;
 
       const scopedUpdates = updates
+        .filter(item => attachment.includeHidden === true || publicIds.has(item.serverId))
         .filter(item => this._shouldDeliver(attachment.scope, item.serverId, attachment.serverIds))
         .map(maskPublicIpUpdate);
       if (scopedUpdates.length === 0) continue;
@@ -2160,7 +2190,7 @@ export class MetricsBroadcaster {
         }
 
         const serverIds = normalizedServerIds.ids;
-        ws.serializeAttachment({ scope, serverIds });
+        ws.serializeAttachment({ ...current, scope, serverIds });
         try {
           ws.send(JSON.stringify({
             type: 'subscribed',

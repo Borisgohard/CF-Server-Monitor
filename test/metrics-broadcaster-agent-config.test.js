@@ -893,7 +893,7 @@ test('Agent WSS batches all-scope subscribers while single-server subscribers st
   const broadcaster = makeBroadcaster([
     makeFrontendSocket({ scope: 'all', serverIds: ['server-1', 'server-2'] }, allMessages),
     makeFrontendSocket({ scope: 'server-1', serverIds: [] }, singleMessages)
-  ]);
+  ], { DB: { prepare: () => ({ all: async () => ({ results: [{ id: 'server-1' }, { id: 'server-2' }] }) }) } });
 
   await broadcaster._ingestRealtimeUpdates([{
     serverId: 'server-1',
@@ -913,7 +913,7 @@ test('Agent WSS batches all-scope subscribers while single-server subscribers st
   assert.equal(singleMessages.every(message => message.updates.length === 1), true);
   assert.notEqual(broadcaster.frontendBroadcastTimer, null);
 
-  broadcaster._flushFrontendBroadcastBatch();
+  await broadcaster._flushFrontendBroadcastBatch();
 
   assert.equal(allMessages.length, 1);
   assert.equal(allMessages[0].type, 'batchUpdate');

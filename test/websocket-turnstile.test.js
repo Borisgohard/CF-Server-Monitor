@@ -25,13 +25,13 @@ function protocols(value) {
   return 'cfsm-v1, cfsm-turnstile.' + value.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
-async function fixture(t, overrides = {}) {
+async function fixture(t, overrides = {}, realBroadcaster = false) {
   const mf = new Miniflare({
     workers: [{
       name: 'app', modules: true, script: bundled.outputFiles[0].text,
       compatibilityDate: '2024-12-01', compatibilityFlags: ['nodejs_compat'],
       bindings: { API_SECRET: 'local-test-agent-secret' }, d1Databases: ['DB'],
-      durableObjects: { METRICS_BROADCASTER: { className: 'UpgradeStub', scriptName: 'upgrade-stub' } }
+      durableObjects: { METRICS_BROADCASTER: realBroadcaster ? 'MetricsBroadcaster' : { className: 'UpgradeStub', scriptName: 'upgrade-stub' } }
     }, {
       name: 'upgrade-stub', modules: true, script: `
         export class UpgradeStub {
@@ -114,4 +114,50 @@ test('Turnstile-disabled sites retain their existing realtime behavior', async t
   const response = await upgrade(mf, '/api/ws', { 'Sec-WebSocket-Protocol': 'cfsm-v1' });
   assert.equal(response.status, 101);
   assert.equal(response.headers.get('Sec-WebSocket-Protocol'), 'cfsm-v1');
+});
+
+test('real Durable Object grants hidden-node access only to authenticated administrators', async t => {
+  const mf = await fixture(t, {}, true);
+  const db = await mf.getD1Database('DB', 'app');
+  await db.prepare('CREATE TABLE servers (id TEXT PRIMARY KEY, is_hidden INTEGER)').run();
+  await db.prepare("INSERT INTO servers VALUES ('visible', 0), ('hidden', 1)").run();
+  const namespace = await mf.getDurableObjectNamespace('METRICS_BROADCASTER', 'app');
+  const stub = namespace.get(namespace.idFromName('global'));
+  const login = await generateToken({}, { jwt_secret: JWT_SECRET });
+  const verified = await proof();
+  for (const admin of [false, true]) {
+    const response = await mf.dispatchFetch('https://example.com/api/ws?subscribe=all&includeHidden=true', {
+      headers: {
+        Upgrade: 'websocket', 'Sec-WebSocket-Protocol': protocols(verified),
+        'X-Include-Hidden': 'true',
+        ...(admin ? { Cookie: 'cfsm_auth=' + encodeURIComponent(login) } : {})
+      }
+    });
+    assert.equal(response.status, 101);
+    const ws = response.webSocket;
+    ws.accept();
+    const nextMessage = type => new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('No ' + type + ' message')), 2000);
+      const listener = event => {
+        const message = JSON.parse(event.data);
+        if (message.type !== type) return;
+        clearTimeout(timeout);
+        ws.removeEventListener('message', listener);
+        resolve(message);
+      };
+      ws.addEventListener('message', listener);
+    });
+    try {
+      const subscribed = nextMessage('subscribed');
+      ws.send(JSON.stringify({ type: 'subscribe', scope: 'all', ids: ['visible', 'hidden'], includeHidden: true }));
+      await subscribed;
+      const batch = nextMessage('batchUpdate');
+      await stub.fetch('http://internal/batch-push', { method: 'POST', body: JSON.stringify({
+        updates: ['visible', 'hidden'].map(serverId => ({ serverId, payload: { cpu: 10 } }))
+      }) });
+      assert.deepEqual((await batch).updates.map(item => item.serverId), admin ? ['visible', 'hidden'] : ['visible']);
+    } finally {
+      ws.close(1000, 'test complete');
+    }
+  }
 });
