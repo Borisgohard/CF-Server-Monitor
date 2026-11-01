@@ -260,7 +260,7 @@ export default {
         
         if (!hasValidCookie) {
           const turnstileToken = request.headers.get('X-Turnstile-Token');
-          const isVerified = await verifyTurnstileToken(turnstileToken, turnstileSecretKey);
+          const isVerified = await verifyTurnstileToken(turnstileToken, turnstileSecretKey, url.hostname);
           
           if (!isVerified) {
             const response = createErrorResponse(new AppError('Turnstile verification failed', 403));

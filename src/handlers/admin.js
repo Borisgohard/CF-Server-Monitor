@@ -475,7 +475,7 @@ async function handleLoginAction({ request, env, sys, data }) {
 
   if (turnstileEnabled || turnstileLoginEnabled) {
     const turnstileToken = request.headers.get('X-Turnstile-Token');
-    const isTurnstileVerified = await verifyTurnstileToken(turnstileToken, turnstileSecretKey);
+    const isTurnstileVerified = await verifyTurnstileToken(turnstileToken, turnstileSecretKey, new URL(request.url).hostname);
 
     if (!isTurnstileVerified) {
       return createErrorResponse(new AppError('verificationFailed', 403));

@@ -25,12 +25,18 @@ function protocols(value) {
   return 'cfsm-v1, cfsm-turnstile.' + value.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
-async function fixture(t, overrides = {}, realBroadcaster = false) {
+async function fixture(t, overrides = {}, realBroadcaster = false, siteverifyHostname) {
   const mf = new Miniflare({
     workers: [{
       name: 'app', modules: true, script: bundled.outputFiles[0].text,
       compatibilityDate: '2024-12-01', compatibilityFlags: ['nodejs_compat'],
       bindings: { API_SECRET: 'local-test-agent-secret' }, d1Databases: ['DB'],
+      ...(siteverifyHostname === undefined ? {} : {
+        outboundService: async request => {
+          assert.equal(request.url, 'https://challenges.cloudflare.com/turnstile/v0/siteverify');
+          return Response.json({ success: true, hostname: siteverifyHostname });
+        }
+      }),
       durableObjects: { METRICS_BROADCASTER: realBroadcaster ? 'MetricsBroadcaster' : { className: 'UpgradeStub', scriptName: 'upgrade-stub' } }
     }, {
       name: 'upgrade-stub', modules: true, script: `
@@ -114,6 +120,22 @@ test('Turnstile-disabled sites retain their existing realtime behavior', async t
   const response = await upgrade(mf, '/api/ws', { 'Sec-WebSocket-Protocol': 'cfsm-v1' });
   assert.equal(response.status, 101);
   assert.equal(response.headers.get('Sec-WebSocket-Protocol'), 'cfsm-v1');
+});
+
+test('public realtime and admin login validate the Siteverify hostname', async t => {
+  for (const hostname of ['example.com', 'other.example.com', 'example.com.invalid', '']) {
+    await t.test(hostname || 'missing hostname', async t => {
+      const mf = await fixture(t, {}, false, hostname);
+      const expected = hostname === 'example.com';
+      const headers = { 'X-Turnstile-Token': 'local-test-token' };
+      assert.equal((await upgrade(mf, '/api/ws', headers)).status, expected ? 101 : 403);
+      const login = await mf.dispatchFetch('https://example.com/admin/api', {
+        method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'login', username: 'admin', password: 'local-test-agent-secret' })
+      });
+      assert.equal(login.status, expected ? 200 : 403);
+    });
+  }
 });
 
 test('real Durable Object grants hidden-node access only to authenticated administrators', async t => {

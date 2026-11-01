@@ -7,12 +7,13 @@
  * 验证 Turnstile token
  * @param {string} token - Turnstile token
  * @param {string} secretKey - Turnstile secret key
+ * @param {string} expectedHostname - 当前请求的主机名
  * @returns {Promise<boolean>} 验证结果
  */
 const TURNSTILE_VERIFY_TIMEOUT_MS = 5000;
 
-export async function verifyTurnstileToken(token, secretKey) {
-  if (!token || !secretKey) {
+export async function verifyTurnstileToken(token, secretKey, expectedHostname) {
+  if (!token || !secretKey || !expectedHostname) {
     return false;
   }
 
@@ -33,7 +34,7 @@ export async function verifyTurnstileToken(token, secretKey) {
     });
     
     const data = await response.json();
-    return data.success === true;
+    return response.ok && data.success === true && data.hostname === expectedHostname;
   } catch (e) {
     console.error('Turnstile verification error:', e);
     return false;
