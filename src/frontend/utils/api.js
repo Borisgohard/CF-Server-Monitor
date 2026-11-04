@@ -1,4 +1,4 @@
-import { http } from './http'
+import { http, DEFAULT_REQUEST_TIMEOUT_MS } from './http'
 import { getApiBases, getWsBase, hasMultipleApiBases, getTitle } from './config'
 import { DEFAULT_SITE_TITLE, FRONTEND_WS_TIMEOUT_MINUTES_MAX, LATENCY_WINDOW, STORAGE } from './constants'
 import { ref } from 'vue'
@@ -9,6 +9,7 @@ import { resolveDisplayMode } from './displayMode.js'
 export const VERSION = ref('')
 export const LAST_WORKERS_VERSION = ref('')
 export const LAST_AGENT_VERSION = ref('')
+let verificationReloadPending = false
 
 export const normalizeLiveSocketTimeoutMinutes = (value) => {
   const minutes = Number(value)
@@ -27,7 +28,7 @@ export const createLiveSocket = (subscribe, handlers = {}, apiIndex = 0, serverI
   let manualClose = false
   let reconnectTimer = null
   let reconnectDelay = TIME.RECONNECT_INITIAL_DELAY_MS
-  let reconnectAttempts = 0
+  let connectionGeneration = 0
   let connectionLifetimeTimer = null
   const MAX_REPLAY_DELAY = 120000
   let isConnected = false
@@ -143,7 +144,7 @@ export const createLiveSocket = (subscribe, handlers = {}, apiIndex = 0, serverI
   }
 
   const connect = () => {
-    manualClose = false
+    if (manualClose || (typeof document !== 'undefined' && document.hidden)) return
     let socket = null
     try {
       const url = new URL(`${getWsBaseByIndex(apiIndex)}/api/ws`)
@@ -170,7 +171,6 @@ export const createLiveSocket = (subscribe, handlers = {}, apiIndex = 0, serverI
         return
       }
       reconnectDelay = TIME.RECONNECT_INITIAL_DELAY_MS
-      reconnectAttempts = 0
       try {
         socket.send(JSON.stringify({
           type: 'subscribe',
@@ -223,21 +223,49 @@ export const createLiveSocket = (subscribe, handlers = {}, apiIndex = 0, serverI
     })
   }
 
+  const reconnectWithVerification = async () => {
+    if (manualClose || (typeof document !== 'undefined' && document.hidden)) return
+    const generation = connectionGeneration
+    const result = await http.getByIndex('/api/config', apiIndex, {
+      includeTurnstileToken: false,
+      autoRedirect: false,
+      timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS
+    })
+    if (manualClose || generation !== connectionGeneration) return
+    if (typeof document !== 'undefined' && document.hidden) return
+
+    const verificationRequired = result.verificationRequired || (
+      result.status === 200 &&
+      (result.data?.turnstile_enabled === true || result.data?.turnstile_enabled === 'true') &&
+      result.data?.verified !== true
+    )
+    if (verificationRequired) {
+      manualClose = true
+      setStatus(false, 'verification required')
+      if (!verificationReloadPending) {
+        verificationReloadPending = true
+        window.location.reload()
+      }
+      return
+    }
+    if (result.error || result.status !== 200) {
+      setStatus(false, 'waiting to reconnect')
+      scheduleReconnect()
+      return
+    }
+    connect()
+  }
+
   const scheduleReconnect = () => {
     if (manualClose) return
     if (reconnectTimer) return
-    if (reconnectAttempts >= TIME.MAX_RECONNECT_ATTEMPTS) {
-      setStatus(false, 'max reconnect attempts reached')
-      return
-    }
+    const delay = reconnectDelay
+    reconnectDelay = Math.min(reconnectDelay * 2, TIME.RECONNECT_MAX_DELAY_MS)
 
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null
-      reconnectAttempts++
-      const delay = reconnectDelay
-      reconnectDelay = Math.min(reconnectDelay * 2, TIME.RECONNECT_MAX_DELAY_MS)
-      setTimeout(connect, delay)
-    }, 50)
+      reconnectWithVerification()
+    }, delay)
   }
 
   connect()
@@ -245,22 +273,27 @@ export const createLiveSocket = (subscribe, handlers = {}, apiIndex = 0, serverI
   return {
     close() {
       manualClose = true
-      reconnectAttempts = TIME.MAX_RECONNECT_ATTEMPTS
+      connectionGeneration++
       clearReplayTimers()
       clearConnectionLifetimeTimer()
       if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null }
-      if (ws) { try { ws.close() } catch (_) {} ws = null }
+      const socket = ws
+      ws = null
+      if (socket) { try { socket.close() } catch (_) {} }
       setStatus(false, 'disconnected')
     },
     reconnect() {
       manualClose = false
-      reconnectAttempts = 0
+      connectionGeneration++
+      reconnectDelay = TIME.RECONNECT_INITIAL_DELAY_MS
       clearReplayTimers()
       clearConnectionLifetimeTimer()
       if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null }
-      if (ws) { try { ws.close() } catch (_) {} ws = null }
+      const socket = ws
+      ws = null
+      if (socket) { try { socket.close() } catch (_) {} }
       setStatus(false, 'reconnecting')
-      connect()
+      reconnectWithVerification()
     },
     get isConnected() {
       return isConnected

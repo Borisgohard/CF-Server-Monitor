@@ -75,12 +75,16 @@ const handleResponse = async (res, options = {}) => {
   }
   
   if (res.status === 403) {
+    const data = await res.json().catch(() => null)
     localStorage.removeItem(STORAGE.TURNSTILE_TOKEN)
     localStorage.removeItem(TURNSTILE_VERIFIED_KEY)
     if (autoRedirect) {
       window.location.reload()
     }
-    return { error: DEFAULT_ERROR_MESSAGES[403], status: 403 }
+    return {
+      error: DEFAULT_ERROR_MESSAGES[403], status: 403,
+      verificationRequired: data?.error === 'Turnstile verification failed'
+    }
   }
   
   if (!res.ok) {
